@@ -1,7 +1,9 @@
 // Required: Feature widgets keep closely related private widgets together.
 import 'dart:async';
 
-import 'package:auravibes_app/domain/entities/agent_entity.dart';
+import 'package:auravibes_app/domain/entities/agent_list_query.dart';
+import 'package:auravibes_app/domain/entities/agent_visibility.dart';
+import 'package:auravibes_app/features/agents/providers/agent_list_notifier.dart';
 import 'package:auravibes_app/features/agents/providers/agent_repository_providers.dart';
 import 'package:auravibes_app/features/agents/usecases/delete_agent_usecase.dart';
 import 'package:auravibes_app/i18n/locale_keys.dart';
@@ -9,6 +11,7 @@ import 'package:auravibes_app/widgets/text_locale.dart';
 import 'package:auravibes_ui/ui.dart';
 import 'package:easy_localization/easy_localization.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter_hooks/flutter_hooks.dart';
 import 'package:go_router/go_router.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 
@@ -23,16 +26,30 @@ class const AgentsScreen({required final String workspaceId, super.key})
     extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    final agentsAsync = ref.watch(agentsProvider(workspaceId));
+    final agentsAsync = ref.watch(agentListProvider(workspaceId));
 
     return AuraScreen(
       child: _AgentsContent(agentsAsync: agentsAsync, workspaceId: workspaceId),
-      appBar: _AgentsAppBar(onCreate: () => _openCreate(context)),
+      appBar: _AgentsAppBar(onCreate: () => _openCreate(context, ref)),
     );
   }
 
-  void _openCreate(BuildContext context) {
-    final _ = context.push('/workspaces/$workspaceId/more/agents/new');
+  void _openCreate(BuildContext context, WidgetRef ref) {
+    unawaited(_openAgentEditor(context, ref, 'new'));
+  }
+
+  Future<void> _openAgentEditor(
+    BuildContext context,
+    WidgetRef ref,
+    String agentId,
+  ) async {
+    final changed = await context.push<bool>(
+      '/workspaces/$workspaceId/more/agents/$agentId',
+    );
+    if (changed == true) {
+      final _ = ref.invalidate(agentsProvider(workspaceId));
+      await ref.read(agentListProvider(workspaceId).notifier).refresh();
+    }
   }
 }
 
@@ -40,11 +57,11 @@ class _AgentsContent extends StatelessWidget {
   new({required this.agentsAsync, required this.workspaceId})
     : _child = switch (agentsAsync) {
         AsyncData(:final value) => _AgentsList(
-          agents: value,
+          state: value,
           workspaceId: workspaceId,
         ),
         AsyncLoading(:final value?) => _AgentsList(
-          agents: value,
+          state: value,
           workspaceId: workspaceId,
         ),
         AsyncLoading() => const Center(child: AuraSpinner()),
@@ -53,7 +70,7 @@ class _AgentsContent extends StatelessWidget {
         ),
       };
 
-  final AsyncValue<List<AgentEntity>> agentsAsync;
+  final AsyncValue<AgentListState> agentsAsync;
   final String workspaceId;
   final Widget _child;
 
@@ -94,27 +111,31 @@ class const _AgentsBackButton() extends StatelessWidget {
 }
 
 class const _AgentsList({
-  required final List<AgentEntity> agents,
+  required final AgentListState state,
   required final String workspaceId,
 }) extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    if (agents.isEmpty) {
-      return _AgentsEmptyState(onCreate: () => _openCreate(context));
+    if (state.agents.isEmpty && !state.hasFilters) {
+      return _AgentsEmptyState(onCreate: () => _openCreate(context, ref));
     }
 
-    return _AgentsListView(
-      agents: agents,
-      onTap: _openAgentCallback(context),
+    return _AgentsSearchList(
+      state: state,
+      workspaceId: workspaceId,
+      onTap: _openAgentCallback(context, ref),
       onSelection: _selectionCallback(context, ref),
     );
   }
 
-  ValueChanged<AgentEntity> _openAgentCallback(BuildContext context) {
-    return (agent) => _openAgent(context, agent.id);
+  ValueChanged<AgentListItem> _openAgentCallback(
+    BuildContext context,
+    WidgetRef ref,
+  ) {
+    return (agent) => _openAgent(context, ref, agent.id);
   }
 
-  void Function(String value, AgentEntity agent) _selectionCallback(
+  void Function(String value, AgentListItem agent) _selectionCallback(
     BuildContext context,
     WidgetRef ref,
   ) {
@@ -126,17 +147,17 @@ class const _AgentsList({
     ));
   }
 
-  void _openCreate(BuildContext context) {
-    final _ = context.push('/workspaces/$workspaceId/more/agents/new');
+  void _openCreate(BuildContext context, WidgetRef ref) {
+    unawaited(_openAndRefresh(context, ref, 'new'));
   }
 
-  void _openAgent(BuildContext context, String agentId) {
-    final _ = context.push('/workspaces/$workspaceId/more/agents/$agentId');
+  void _openAgent(BuildContext context, WidgetRef ref, String agentId) {
+    unawaited(_openAndRefresh(context, ref, agentId));
   }
 
   void _handleSelection(_AgentSelection selection) {
     if (selection.value == 'edit') {
-      _openAgent(selection.context, selection.agentId);
+      _openAgent(selection.context, selection.ref, selection.agentId);
 
       return;
     }
@@ -164,13 +185,217 @@ class const _AgentsList({
         .read(deleteAgentUsecaseProvider(workspaceId))
         .call(agentId);
     final _ = ref.invalidate(agentsProvider(workspaceId));
+    await ref.read(agentListProvider(workspaceId).notifier).refresh();
+  }
+
+  Future<void> _openAndRefresh(
+    BuildContext context,
+    WidgetRef ref,
+    String agentId,
+  ) async {
+    final changed = await context.push<bool>(
+      '/workspaces/$workspaceId/more/agents/$agentId',
+    );
+    if (changed != true) return;
+    final _ = ref.invalidate(agentsProvider(workspaceId));
+    await ref.read(agentListProvider(workspaceId).notifier).refresh();
   }
 }
 
+class const _AgentsSearchList({
+  required final AgentListState state,
+  required final String workspaceId,
+  required final ValueChanged<AgentListItem> onTap,
+  required final void Function(String value, AgentListItem agent) onSelection,
+}) extends HookConsumerWidget {
+  @override
+  Widget build(BuildContext _, WidgetRef ref) {
+    final controller = useTextEditingController(text: state.search);
+    final notifier = ref.read(agentListProvider(workspaceId).notifier);
+
+    return Column(
+      children: [
+        Padding(
+          padding: const .only(top: 8, left: 8, right: 8),
+          child: AuraColumn(
+            children: [
+              AuraInput(
+                controller: controller,
+                placeholder: const TextLocale(
+                  LocaleKeys.agents_search_placeholder,
+                ),
+                prefixIcon: const AuraIcon(Icons.search),
+                size: .small,
+                onChanged: notifier.setSearch,
+              ),
+              _AgentFilters(state: state, notifier: notifier),
+            ],
+            spacing: .sm,
+          ),
+        ),
+        if (state.isRefreshing) const LinearProgressIndicator(minHeight: 2),
+        if (state.refreshFailed)
+          _AgentLoadError(onRetry: () => unawaited(notifier.retry())),
+        Expanded(
+          child: state.agents.isEmpty
+              ? const _AgentsSearchEmptyState()
+              : _AgentsListView(
+                  agents: state.agents,
+                  onTap: onTap,
+                  onSelection: onSelection,
+                ),
+        ),
+        if (state.nextCursor != null)
+          _LoadMore(
+            failed: state.loadMoreFailed,
+            isLoading: state.isLoadingMore,
+            onPressed: () => unawaited(notifier.loadMore()),
+          ),
+      ],
+    );
+  }
+}
+
+class const _AgentFilters({
+  required final AgentListState state,
+  required final AgentListNotifier notifier,
+}) extends StatelessWidget {
+  @override
+  Widget build(BuildContext _) => Row(
+    children: [
+      Expanded(
+        child: AuraDropdownSelector<String>(
+          options: _typeOptions,
+          value: switch (state.type) {
+            null => 'all',
+            .chatSelector => 'chat',
+            .subAgentList => 'sub',
+          },
+          onChanged: _setType,
+          label: const TextLocale(LocaleKeys.agents_filter_type),
+        ),
+      ),
+      const SizedBox(width: 8),
+      Expanded(
+        child: AuraDropdownSelector<String>(
+          options: _statusOptions,
+          value: switch (state.status) {
+            null => 'all',
+            .enabled => 'enabled',
+            .disabled => 'disabled',
+          },
+          onChanged: _setStatus,
+          label: const TextLocale(LocaleKeys.agents_filter_status),
+        ),
+      ),
+    ],
+  );
+
+  void _setType(String? value) => notifier.setType(switch (value) {
+    'chat' => .chatSelector,
+    'sub' => .subAgentList,
+    _ => null,
+  });
+
+  void _setStatus(String? value) => notifier.setStatus(switch (value) {
+    'enabled' => .enabled,
+    'disabled' => .disabled,
+    _ => null,
+  });
+}
+
+const _typeOptions = <AuraDropdownOption<String>>[
+  AuraDropdownOption(
+    value: 'all',
+    child: TextLocale(LocaleKeys.agents_filter_all),
+  ),
+  AuraDropdownOption(
+    value: 'chat',
+    child: TextLocale(LocaleKeys.agents_visibility_chat_selector),
+  ),
+  AuraDropdownOption(
+    value: 'sub',
+    child: TextLocale(LocaleKeys.agents_visibility_sub_agent_list),
+  ),
+];
+
+const _statusOptions = <AuraDropdownOption<String>>[
+  AuraDropdownOption(
+    value: 'all',
+    child: TextLocale(LocaleKeys.agents_filter_all),
+  ),
+  AuraDropdownOption(
+    value: 'enabled',
+    child: TextLocale(LocaleKeys.agents_enabled_label),
+  ),
+  AuraDropdownOption(
+    value: 'disabled',
+    child: TextLocale(LocaleKeys.agents_disabled_label),
+  ),
+];
+
+class const _AgentLoadError({required final VoidCallback onRetry})
+    extends StatelessWidget {
+  @override
+  Widget build(BuildContext _) => Padding(
+    padding: const EdgeInsets.all(8),
+    child: AuraButton(
+      onPressed: onRetry,
+      child: const TextLocale(LocaleKeys.common_reload),
+      variant: .outlined,
+    ),
+  );
+}
+
+class const _LoadMore({
+  required final bool failed,
+  required final bool isLoading,
+  required final VoidCallback onPressed,
+}) extends StatelessWidget {
+  @override
+  Widget build(BuildContext _) => Padding(
+    padding: const EdgeInsets.all(8),
+    child: AuraColumn(
+      children: [
+        if (failed)
+          const AuraText(
+            child: TextLocale(LocaleKeys.agents_load_more_error),
+            style: .bodySmall,
+          ),
+        AuraButton(
+          onPressed: onPressed,
+          child: const TextLocale(LocaleKeys.common_show_more),
+          variant: .outlined,
+          isLoading: isLoading,
+        ),
+      ],
+      spacing: .xs,
+      mainAxisSize: .min,
+    ),
+  );
+}
+
+class const _AgentsSearchEmptyState() extends StatelessWidget {
+  @override
+  Widget build(BuildContext _) => const Center(
+    child: AuraColumn(
+      children: [
+        AuraIcon(Icons.search_off, size: .large),
+        AuraText(
+          child: TextLocale(LocaleKeys.agents_search_no_results),
+          textAlign: .center,
+        ),
+      ],
+      spacing: .sm,
+      mainAxisSize: .min,
+    ),
+  );
+}
+
 class const _AgentsListView({
-  required final List<AgentEntity> agents,
-  required final ValueChanged<AgentEntity> onTap,
-  required final void Function(String value, AgentEntity agent) onSelection,
+  required final List<AgentListItem> agents,
+  required final ValueChanged<AgentListItem> onTap,
+  required final void Function(String value, AgentListItem agent) onSelection,
 }) extends StatelessWidget {
   @override
   Widget build(BuildContext _) {
@@ -231,7 +456,7 @@ class _AgentsEmptyContent extends StatelessWidget {
 }
 
 class const _AgentListItem({
-  required final AgentEntity agent,
+  required final AgentListItem agent,
   required final VoidCallback onTap,
   required final ValueChanged<String> onSelection,
 }) extends StatelessWidget {
@@ -247,7 +472,7 @@ class const _AgentListItem({
   }
 }
 
-class const _AgentListItemDetails({required final AgentEntity agent})
+class const _AgentListItemDetails({required final AgentListItem agent})
     extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
@@ -263,7 +488,7 @@ class const _AgentListItemDetails({required final AgentEntity agent})
   }
 }
 
-class const _AgentNameRow({required final AgentEntity agent})
+class const _AgentNameRow({required final AgentListItem agent})
     extends StatelessWidget {
   @override
   Widget build(BuildContext _) {
@@ -280,14 +505,14 @@ class const _AgentNameRow({required final AgentEntity agent})
   }
 }
 
-class const _AgentSkillCount({required final AgentEntity agent})
+class const _AgentSkillCount({required final AgentListItem agent})
     extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return AuraText(
       child: Text(
         LocaleKeys.agents_skill_count.plural(
-          agent.skills.length,
+          agent.skillCount,
           context: context,
         ),
       ),
@@ -296,7 +521,7 @@ class const _AgentSkillCount({required final AgentEntity agent})
   }
 }
 
-class const _AgentVisibility({required final AgentEntity agent})
+class const _AgentVisibility({required final AgentListItem agent})
     extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
@@ -321,9 +546,9 @@ class const _AgentMenu({required final ValueChanged<String> onSelected})
 }
 
 class const _AgentListItemBuilder({
-  required final AgentEntity agent,
-  required final ValueChanged<AgentEntity> onTap,
-  required final void Function(String value, AgentEntity agent) onSelection,
+  required final AgentListItem agent,
+  required final ValueChanged<AgentListItem> onTap,
+  required final void Function(String value, AgentListItem agent) onSelection,
 }) extends StatelessWidget {
   @override
   Widget build(BuildContext _) {

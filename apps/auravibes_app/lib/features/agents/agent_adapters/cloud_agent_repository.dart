@@ -1,13 +1,20 @@
 import 'dart:convert';
 
 import 'package:auravibes_app/domain/entities/agent_entity.dart';
+import 'package:auravibes_app/domain/entities/agent_list_query.dart';
 import 'package:auravibes_app/features/agents/agent_adapters/agent_repository.dart';
+import 'package:auravibes_app/features/workspaces/services/cloud_app_exception.dart';
 import 'package:auravibes_app/features/workspaces/services/cloud_resource_mapper.dart';
 import 'package:auravibes_app/features/workspaces/services/cloud_workspace_resource_store.dart';
+import 'package:auravibes_app/features/workspaces/services/cloud_workspace_state_gateway.dart';
 import 'package:auravibes_server_client/auravibes_server_client.dart';
 import 'package:uuid/v7.dart';
 
 typedef ReadCloudAgents = Future<List<WorkspaceResource>> Function();
+typedef ReadCloudAgent = Future<List<WorkspaceResource>> Function(
+  String agentId,
+);
+typedef ListCloudAgents = Future<AgentListPage> Function(AgentListQuery query);
 typedef PatchCloudAgents = Future<PatchWorkspaceStateResponse> Function({
   required String requestId,
   required List<WorkspacePatchOperation> operations,
@@ -52,16 +59,21 @@ typedef _AgentUpdateResponse = ({
 class CloudAgentRepository({
   @override required final String workspaceId,
   @override required final ReadCloudAgents read,
+  @override required final ReadCloudAgent readAgent,
+  @override required final ListCloudAgents list,
   @override required final PatchCloudAgents patch,
 }) with _CloudAgentRepositoryRead, _CloudAgentRepositoryWrite
     implements AgentRepository {
   new fromStore({
     required String workspaceId,
     required CloudWorkspaceResourceStore store,
+    required Future<CloudWorkspaceStateGateway?> gateway,
   }) : this(
          patch: store.patch,
          workspaceId: workspaceId,
          read: () => _readCloudAgentResources(store),
+         readAgent: (agentId) => _readCloudAgent(gateway, agentId),
+         list: (query) => _listCloudAgents(gateway, query),
        );
 
   @override
@@ -176,6 +188,8 @@ List<AgentSkillRef> _decodeAgentSkills(
 mixin _CloudAgentRepositoryRead {
   String get workspaceId;
   ReadCloudAgents get read;
+  ReadCloudAgent get readAgent;
+  ListCloudAgents get list;
   Map<String, int> get _revisions;
 
   Stream<List<AgentEntity>> _watchAgentsByWorkspace(String workspaceId) async* {
@@ -196,8 +210,10 @@ mixin _CloudAgentRepositoryRead {
     ];
   }
 
+  Future<AgentListPage> listAgents(AgentListQuery query) => list(query);
+
   Future<AgentEntity?> getAgentById(String agentId) async {
-    final resources = await read();
+    final resources = await readAgent(agentId);
     final resource = _agentResource(resources, agentId);
     if (resource == null) return null;
     _revisions[agentId] = resource.revision;
@@ -208,7 +224,7 @@ mixin _CloudAgentRepositoryRead {
 
 mixin _CloudAgentRepositoryWrite {
   String get workspaceId;
-  ReadCloudAgents get read;
+  ReadCloudAgent get readAgent;
   PatchCloudAgents get patch;
   Map<String, int> get _revisions;
 
@@ -233,7 +249,7 @@ mixin _CloudAgentRepositoryWrite {
       _decodeUpdatedAgent(await _updateAgentResponse(agentId, agent));
 
   Future<bool> deleteAgent(String agentId) async {
-    final resources = await read();
+    final resources = await readAgent(agentId);
     final _ = await _patchAgentState(
       patch,
       _deleteAgentOperations(resources, agentId, _revisions),
@@ -261,7 +277,7 @@ extension on _CloudAgentRepositoryWrite {
     String agentId,
     AgentToUpdate agent,
   ) async => (
-    resources: await read(),
+    resources: await readAgent(agentId),
     agentId: agentId,
     agent: agent,
     revisions: _revisions,
@@ -454,3 +470,64 @@ Future<List<WorkspaceResource>> _readCloudAgentResources(
 
   return response.pages.expand((page) => page.resources).toList();
 }
+
+Future<CloudWorkspaceStateGateway> _requireAgentGateway(
+  Future<CloudWorkspaceStateGateway?> gateway,
+) async =>
+    await gateway ??
+    (throw StateError('Cloud agent operations require an active gateway'));
+
+Future<List<WorkspaceResource>> _readCloudAgent(
+  Future<CloudWorkspaceStateGateway?> gateway,
+  String agentId,
+) => CloudAppErrors.guardCall(.state, () async {
+  final resolved = await _requireAgentGateway(gateway);
+
+  return await resolved.client.agentCatalog.getResources(
+    .new(workspaceId: resolved.workspace.cloudWorkspaceId, agentId: agentId),
+  );
+});
+
+Future<AgentListPage> _listCloudAgents(
+  Future<CloudWorkspaceStateGateway?> gateway,
+  AgentListQuery query,
+) => CloudAppErrors.guardCall(.state, () async {
+  final resolved = await _requireAgentGateway(gateway);
+  final page = await resolved.client.agentCatalog.list(
+    .new(
+      workspaceId: resolved.workspace.cloudWorkspaceId,
+      search: query.search,
+      type: switch (query.type) {
+        .chatSelector => .chatSelector,
+        .subAgentList => .subAgentList,
+        null => null,
+      },
+      status: switch (query.status) {
+        .enabled => .enabled,
+        .disabled => .disabled,
+        null => null,
+      },
+      limit: query.limit,
+      cursor: query.cursor,
+    ),
+  );
+
+  return AgentListPage(
+    agents: [
+      for (final agent in page.agents)
+        AgentListItem(
+          id: agent.id,
+          name: agent.name,
+          description: agent.description,
+          isEnabled: agent.isEnabled,
+          visibility: switch (agent.visibility) {
+            .chatSelector => .chatSelector,
+            .subAgentList => .subAgentList,
+            .both => .both,
+          },
+          skillCount: agent.skillCount,
+        ),
+    ],
+    nextCursor: page.nextCursor,
+  );
+});
