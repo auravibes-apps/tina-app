@@ -1,5 +1,8 @@
+import 'dart:convert';
+
 import 'package:auravibes_app/data/database/drift/app_database.dart';
 import 'package:auravibes_app/domain/entities/agent_entity.dart';
+import 'package:auravibes_app/domain/entities/agent_list_query.dart';
 import 'package:auravibes_app/features/agents/agent_adapters/agent_repository.dart';
 
 const _agentContentEmpty = 'Agent content cannot be empty';
@@ -22,6 +25,47 @@ class AgentsRepository(final AppDatabase _database) implements AgentRepository {
     final rows = await _database.agentsDao.getAgentsByWorkspace(workspaceId);
 
     return await _mapAgentRows(rows);
+  }
+
+  @override
+  Future<AgentListPage> listAgents(AgentListQuery query) async {
+    final normalized = _validateListQuery(query);
+    final cursor = _decodeCursor(normalized);
+    final rows = await _database.agentsDao.listAgents(
+      query: normalized,
+      afterName: cursor?.name,
+      afterId: cursor?.id,
+    );
+    final hasMore = rows.length > normalized.limit;
+    final pageRows = rows.take(normalized.limit).toList();
+    final skills = await _database.agentsDao.getSkillsForAgents(
+      pageRows.map((row) => row.id),
+    );
+    final skillCounts = <String, int>{};
+    for (final skill in skills) {
+      final _ = skillCounts.update(
+        skill.agentId,
+        (count) => count + 1,
+        ifAbsent: () => 1,
+      );
+    }
+
+    return AgentListPage(
+      agents: [
+        for (final row in pageRows)
+          AgentListItem(
+            id: row.id,
+            name: row.name,
+            description: row.description,
+            isEnabled: row.isEnabled,
+            visibility: _agentVisibilityFromStorage(row.visibility),
+            skillCount: skillCounts[row.id] ?? 0,
+          ),
+      ],
+      nextCursor: hasMore && pageRows.isNotEmpty
+          ? _encodeCursor(normalized, pageRows.last)
+          : null,
+    );
   }
 
   @override
@@ -64,6 +108,74 @@ class AgentsRepository(final AppDatabase _database) implements AgentRepository {
   Future<bool> deleteAgent(String agentId) =>
       _database.agentsDao.deleteAgent(agentId);
 }
+
+typedef _AgentListCursor = ({String name, String id});
+
+AgentListQuery _validateListQuery(AgentListQuery query) {
+  final search = query.search.trim().toLowerCase();
+  final cursor = query.cursor;
+  if (query.workspaceId.isEmpty ||
+      query.limit < 1 ||
+      query.limit > 100 ||
+      search.length > 200 ||
+      cursor != null && cursor.length > 2048) {
+    throw const AgentValidationException('Invalid agent list query');
+  }
+
+  return AgentListQuery(
+    workspaceId: query.workspaceId,
+    search: search,
+    type: query.type,
+    status: query.status,
+    limit: query.limit,
+    cursor: cursor,
+  );
+}
+
+_AgentListCursor? _decodeCursor(AgentListQuery query) {
+  final value = query.cursor;
+  if (value == null) return null;
+  try {
+    final decoded = jsonDecode(
+      utf8.decode(base64Url.decode(base64Url.normalize(value))),
+    );
+    if (decoded
+        case {
+          'v': 1,
+          'workspace': final String workspaceId,
+          'search': final String search,
+          'type': final String? type,
+          'status': final String? status,
+          'name': final String name,
+          'id': final String id,
+        }
+        when workspaceId == query.workspaceId &&
+            search == query.search &&
+            type == query.type?.name &&
+            status == query.status?.name &&
+            name.isNotEmpty &&
+            id.isNotEmpty) {
+      return (name: name, id: id);
+    }
+  } on FormatException {
+    // Handled below as one typed validation failure.
+  }
+  throw const AgentValidationException('Invalid agent list cursor');
+}
+
+String _encodeCursor(AgentListQuery query, AgentsTable row) => base64Url.encode(
+  utf8.encode(
+    jsonEncode({
+      'v': 1,
+      'workspace': query.workspaceId,
+      'search': query.search,
+      'type': query.type?.name,
+      'status': query.status?.name,
+      'name': row.name.toLowerCase(),
+      'id': row.id,
+    }),
+  ),
+);
 
 extension AgentsRepositoryValidation on AgentsRepository {
   void _validateAgentToCreate(AgentToCreate agent) {

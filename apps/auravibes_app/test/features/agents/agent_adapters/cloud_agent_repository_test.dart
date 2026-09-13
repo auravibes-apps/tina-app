@@ -1,6 +1,7 @@
 import 'dart:convert';
 
 import 'package:auravibes_app/domain/entities/agent_entity.dart';
+import 'package:auravibes_app/domain/entities/agent_list_query.dart';
 import 'package:auravibes_app/features/agents/agent_adapters/cloud_agent_repository.dart';
 import 'package:auravibes_server_client/auravibes_server_client.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -46,6 +47,22 @@ void main() {
           updatedAt: now,
         ),
       ],
+      readAgent: (_) async => [
+        WorkspaceResource(
+          workspaceId: 1,
+          resourceKind: .agent,
+          resourceId: 'agent-1',
+          data: jsonEncode({
+            'name': 'Agent',
+            'content': 'Prompt',
+            'visibility': 'both',
+          }),
+          revision: 3,
+          createdAt: now,
+          updatedAt: now,
+        ),
+      ],
+      list: (_) async => const AgentListPage(agents: []),
     );
 
     expect(
@@ -164,6 +181,8 @@ void main() {
       },
       workspaceId: 'workspace',
       read: () async => List.of(resources),
+      readAgent: (_) async => List.of(resources),
+      list: (_) async => const AgentListPage(agents: []),
     );
 
     final loaded = await repository.getAgentById('agent-1');

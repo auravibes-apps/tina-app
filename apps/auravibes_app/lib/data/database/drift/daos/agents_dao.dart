@@ -1,6 +1,7 @@
 import 'package:auravibes_app/data/database/drift/app_database.dart';
 import 'package:auravibes_app/data/database/drift/tables/agent_skills.dart';
 import 'package:auravibes_app/data/database/drift/tables/agents.dart';
+import 'package:auravibes_app/domain/entities/agent_list_query.dart';
 import 'package:drift/drift.dart';
 
 part 'agents_dao.g.dart';
@@ -23,6 +24,50 @@ extension AgentsDaoReadOperations on AgentsDao {
             ..orderBy([(tbl) => OrderingTerm(expression: tbl.name)]))
           .get();
 
+  Future<List<AgentsTable>> listAgents({
+    required AgentListQuery query,
+    required String? afterName,
+    required String? afterId,
+  }) {
+    final statement = select(agents)
+      ..where((table) {
+        var predicate = table.workspaceId.equals(query.workspaceId);
+        final search = query.search;
+        if (search.isNotEmpty) {
+          final pattern = '%${_escapeLike(search)}%';
+          predicate &=
+              table.name.like(pattern, escapeChar: r'\') |
+              table.description.like(pattern, escapeChar: r'\');
+        }
+        predicate &= switch (query.type) {
+          .chatSelector => table.visibility.isIn(['chatSelector', 'both']),
+          .subAgentList => table.visibility.isIn(['subAgentList', 'both']),
+          null => const Constant(true),
+        };
+        predicate &= switch (query.status) {
+          .enabled => table.isEnabled.equals(true),
+          .disabled => table.isEnabled.equals(false),
+          null => const Constant(true),
+        };
+        if (afterName != null && afterId != null) {
+          final orderedName = table.name.collate(.noCase);
+          predicate &=
+              orderedName.isBiggerThanValue(afterName) |
+              orderedName.equals(afterName) &
+                  table.id.isBiggerThanValue(afterId);
+        }
+
+        return predicate;
+      })
+      ..orderBy([
+        (table) => OrderingTerm(expression: table.name.collate(.noCase)),
+        (table) => OrderingTerm(expression: table.id),
+      ])
+      ..limit(query.limit + 1);
+
+    return statement.get();
+  }
+
   Future<AgentsTable?> getAgentById(String agentId) => (select(
     agents,
   )..where((tbl) => tbl.id.equals(agentId))).getSingleOrNull();
@@ -37,6 +82,9 @@ extension AgentsDaoReadOperations on AgentsDao {
     return (select(agentSkills)..where((tbl) => tbl.agentId.isIn(ids))).get();
   }
 }
+
+String _escapeLike(String value) =>
+    value.replaceAll(r'\', r'\\').replaceAll('%', r'\%').replaceAll('_', r'\_');
 
 extension AgentsDaoWriteOperations on AgentsDao {
   Future<AgentsTable> createAgent(
